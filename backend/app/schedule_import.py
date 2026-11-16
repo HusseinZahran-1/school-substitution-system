@@ -1,10 +1,12 @@
-"""Read common school timetable CSV/XLSX layouts into normalized schedule cells."""
+"""Read school timetable DOCX, CSV, and XLSX layouts into normalized schedule cells."""
 from __future__ import annotations
 
 import csv
 import io
 import re
 import unicodedata
+from zipfile import BadZipFile, ZipFile
+from xml.etree import ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,7 @@ class ScheduleCell:
     class_name: str | None
     subject: str | None
     notes: str | None = None
+    declared_load: int | None = None
 
 
 DAY_ALIASES = {
@@ -45,11 +48,113 @@ def _compact(value: Any) -> str:
 
 
 def _day(value: Any) -> str | None:
-    text = _text(value).casefold()
+    text = _text(value).casefold().replace("ـ", "")
     for alias, day in DAY_ALIASES.items():
-        if alias.casefold() in text:
+        if alias.casefold().replace("ـ", "") in text:
             return day
     return None
+
+
+def _reserve_priority(value: Any) -> int | None:
+    match = re.fullmatch(r"ح\s*([1-5])", _text(value))
+    return int(match.group(1)) if match else None
+
+
+def _docx_schedule(content: bytes) -> tuple[list[ScheduleCell], str]:
+    """Read the school's teacher-by-week DOCX matrix without a third-party parser."""
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    try:
+        with ZipFile(io.BytesIO(content)) as archive:
+            document = ET.fromstring(archive.read("word/document.xml"))
+    except (BadZipFile, KeyError, ET.ParseError) as exc:
+        raise HTTPException(400, "تعذر قراءة ملف Word؛ ارفع ملف DOCX صالحًا يحتوي جدول الحصص") from exc
+
+    def cell_text(cell: ET.Element) -> str:
+        return _text("".join(node.text or "" for node in cell.findall(".//w:t", ns)))
+
+    tables = document.findall(".//w:tbl", ns)
+    for table in tables:
+        grid = table.find("w:tblGrid", ns)
+        grid_columns = len(grid.findall("w:gridCol", ns)) if grid is not None else 0
+        parsed_rows = []
+        for row in table.findall("w:tr", ns):
+            values, spans = [], []
+            for cell in row.findall("w:tc", ns):
+                span_node = cell.find("w:tcPr/w:gridSpan", ns)
+                span = int(span_node.get(f"{{{ns['w']}}}val", "1")) if span_node is not None else 1
+                value = cell_text(cell)
+                values.extend([value] * span)
+                spans.append(span)
+            if grid_columns and len(values) <= grid_columns:
+                values.extend([""] * (grid_columns - len(values)))
+            parsed_rows.append((values, spans))
+
+        if not parsed_rows:
+            continue
+        day_row_index = next((
+            index for index, (values, _) in enumerate(parsed_rows)
+            if len({day for value in values if (day := _day(value))}) >= 4
+        ), None)
+        if day_row_index is None:
+            continue
+
+        days_by_column = []
+        current_day = None
+        for value in parsed_rows[day_row_index][0]:
+            current_day = _day(value) or current_day
+            days_by_column.append(current_day)
+
+        period_row_index = None
+        periods_by_column = []
+        for index in range(day_row_index + 1, min(day_row_index + 4, len(parsed_rows))):
+            values = parsed_rows[index][0]
+            periods = [_period(value) if column < len(days_by_column) and days_by_column[column] else None
+                       for column, value in enumerate(values)]
+            slot_count = sum(period is not None for period in periods[3:])
+            if slot_count >= 20:
+                period_row_index, periods_by_column = index, periods
+                break
+        if period_row_index is None:
+            continue
+
+        slots = [(column, days_by_column[column], periods_by_column[column])
+                 for column in range(3, min(len(days_by_column), len(periods_by_column)))
+                 if days_by_column[column] and periods_by_column[column]]
+        if len(slots) < 20:
+            continue
+
+        output: list[ScheduleCell] = []
+        last_subject = ""
+        for values, spans in parsed_rows[period_row_index + 1:]:
+            # Teacher rows have one cell per grid column. Footer and supervision
+            # rows merge the identity columns and are therefore ignored.
+            if len(spans) < 3 or spans[:3] != [1, 1, 1] or len(values) < len(days_by_column):
+                continue
+            teacher = _text(values[0])
+            if not teacher or _compact(teacher) in {"اسم المعلم", "المشرف العام", "الاشرافوالمناوبةاليومية"}:
+                continue
+            declared_load_text = _text(values[1])
+            declared_load = int(declared_load_text) if re.fullmatch(r"\d+", declared_load_text) else None
+            subject = _text(values[2]) or last_subject
+            if values[2]:
+                last_subject = subject
+            for column, day, period in slots:
+                value = _text(values[column])
+                reserve_priority = _reserve_priority(value)
+                if reserve_priority is not None:
+                    status, class_name = "FREE", None
+                    notes = f"RESERVE_PRIORITY:{reserve_priority}"
+                elif not value or value in {"-", "—", "ــــ"}:
+                    status, class_name, notes = "FREE", None, None
+                elif re.fullmatch(r"ح\s*", value):
+                    status, class_name, notes = "DUTY", None, "احتياط مسجل في الجدول"
+                else:
+                    status, class_name, notes = "TEACHING", value, None
+                output.append(ScheduleCell(teacher, day, period, status, class_name, subject or None, notes, declared_load))
+        if output:
+            return output, "teacher-weekly-docx"
+
+    raise HTTPException(400, "لم أجد جدول معلمين أسبوعيًا واضحًا في ملف Word")
 
 
 def _period(value: Any) -> int | None:
@@ -93,7 +198,7 @@ def _load_rows(filename: str, content: bytes) -> list[list[Any]]:
         except Exception as exc:
             raise HTTPException(400, "تعذر قراءة ملف Excel؛ استخدم ملف XLSX صالحًا") from exc
     if suffix != ".csv":
-        raise HTTPException(400, "الصيغ المدعومة هي CSV وExcel XLSX")
+        raise HTTPException(400, "الصيغ المدعومة هي Word DOCX وCSV وExcel XLSX")
     decoded = None
     for encoding in ("utf-8-sig", "utf-8", "cp1256"):
         try:
@@ -185,12 +290,16 @@ def _status(value: Any, supplied_status: Any = None) -> tuple[str, str | None]:
     marker = raw.casefold()
     if marker in {"", "-", "—", "free", "فراغ", "حرة", "متاح"}:
         return "FREE", None
+    if _reserve_priority(raw) is not None:
+        return "FREE", None
     if marker in {"ح", "احتياط", "مناوبة", "duty"}:
         return "DUTY", None
     return "TEACHING", raw
 
 
 def parse_schedule_file(filename: str, content: bytes) -> tuple[list[ScheduleCell], str]:
+    if Path(filename or "").suffix.lower() == ".docx":
+        return _docx_schedule(content)
     rows = _load_rows(filename, content)
     header_index, mapping = _find_headers(rows)
     header_fields = {field: index for index, (field, _, _) in enumerate(mapping) if field}
@@ -231,7 +340,8 @@ def parse_schedule_file(filename: str, content: bytes) -> tuple[list[ScheduleCel
                     status, class_name = _status(value, get("status"))
                 except ValueError as exc:
                     raise HTTPException(400, f"صف {row_number}: {exc}") from exc
-                output.append(ScheduleCell(teacher, day, period, status, class_name, subject or None, get("notes") or None))
+                output.append(ScheduleCell(teacher, day, period, status, class_name, subject or None,
+                                           get("notes") or (f"RESERVE_PRIORITY:{_reserve_priority(value)}" if _reserve_priority(value) else None)))
         else:
             day = _day(get("day"))
             period = _period(get("period"))
@@ -241,7 +351,9 @@ def parse_schedule_file(filename: str, content: bytes) -> tuple[list[ScheduleCel
                 status, class_name = _status(get("class"), get("status"))
             except ValueError as exc:
                 raise HTTPException(400, f"صف {row_number}: {exc}") from exc
-            output.append(ScheduleCell(teacher, day, period, status, class_name, subject or None, get("notes") or None))
+            source_value = get("class")
+            output.append(ScheduleCell(teacher, day, period, status, class_name, subject or None,
+                                       get("notes") or (f"RESERVE_PRIORITY:{_reserve_priority(source_value)}" if _reserve_priority(source_value) else None)))
     if not output:
         raise HTTPException(400, "الملف لا يحتوي حصصًا قابلة للاستيراد")
     return output, "wide" if wide_columns else "long"

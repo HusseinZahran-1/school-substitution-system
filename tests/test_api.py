@@ -1,8 +1,36 @@
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from backend.app.main import app
 from backend.app.database import get_db
 from backend.app import models as m
+
+def test_school_settings_are_saved_and_returned_for_print_branding(db: Session):
+    def override_db():
+        yield db
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        saved = client.put("/api/school-settings", json={
+            "school_name": "مدرسة الأمل",
+            "school_logo_url": "https://school.example/logo.png",
+        })
+        assert saved.status_code == 200, saved.text
+        loaded = client.get("/api/school-settings")
+        assert loaded.status_code == 200
+        assert loaded.json() == {
+            "school_name": "مدرسة الأمل",
+            "school_logo_url": "https://school.example/logo.png",
+        }
+        uploaded = client.put("/api/school-settings", json={
+            "school_name": "مدرسة الأمل",
+            "school_logo_url": "data:image/webp;base64,UklGRg==",
+        })
+        assert uploaded.status_code == 200, uploaded.text
+        assert client.get("/api/school-settings").json()["school_logo_url"].startswith("data:image/webp;base64,")
+        assert client.get("/api/health").json()["database"] == "connected"
+    finally:
+        app.dependency_overrides.clear()
 
 def test_unknown_teacher_returns_404(db: Session):
     def override_db():
@@ -25,6 +53,75 @@ def test_existing_teacher_is_readable(db: Session):
         assert response.json()["name"] == "موجود"
     finally:
         app.dependency_overrides.clear()
+
+def test_school_accounts_cannot_read_another_schools_teachers(db: Session):
+    from backend.app.security import require_admin
+
+    teacher_a = m.Teacher(name="معلم مشترك الاسم")
+    db.add(teacher_a); db.commit()
+    teacher_a_id = teacher_a.id
+
+    school_b = m.School(name="المدرسة الثانية")
+    db.add(school_b); db.flush()
+    db.info["school_id"] = school_b.id
+    teacher_b = m.Teacher(name="معلم مشترك الاسم")
+    db.add_all([teacher_b, m.SchoolSettings(school_id=school_b.id, school_name=school_b.name)])
+    db.commit()
+    teacher_b_id, school_b_id = teacher_b.id, school_b.id
+    db.info["school_id"] = 1
+
+    def override_db():
+        yield db
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[require_admin] = lambda: m.AdminAccount(id=2, school_id=school_b_id, username="school-b")
+    try:
+        client = TestClient(app)
+        response = client.get("/api/teachers")
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()] == [teacher_b_id]
+        assert client.get(f"/api/teachers/{teacher_a_id}").status_code == 404
+        assert client.delete(f"/api/teachers/{teacher_a_id}").status_code == 404
+        assert client.get("/api/school-settings").json()["school_name"] == "المدرسة الثانية"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(require_admin, None)
+
+def test_replace_import_only_deletes_current_school_schedule(db: Session):
+    import io
+    from backend.app.security import require_admin
+
+    teacher_a = m.Teacher(name="جدول المدرسة الأولى")
+    db.add(teacher_a); db.flush()
+    entry_a = m.ScheduleEntry(teacher_id=teacher_a.id, day_of_week="SUNDAY", period_number=1, status="FREE")
+    db.add(entry_a); db.commit()
+    teacher_a_id = teacher_a.id
+
+    school_b = m.School(name="مدرسة الاستيراد")
+    db.add(school_b); db.flush()
+    db.info["school_id"] = school_b.id
+    teacher_b = m.Teacher(name="جدول المدرسة الثانية")
+    db.add(teacher_b); db.flush()
+    db.add(m.ScheduleEntry(teacher_id=teacher_b.id, day_of_week="SUNDAY", period_number=1, status="FREE"))
+    db.commit()
+    school_b_id = school_b.id
+
+    def override_db():
+        yield db
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[require_admin] = lambda: m.AdminAccount(id=2, school_id=school_b_id, username="school-b")
+    try:
+        content = "teacher,day,period,status,رقم الشعبة,subject,notes\nمعلم جديد,الأحد,1,FREE,,,,\n".encode("utf-8")
+        response = TestClient(app).post(
+            "/api/schedule/import-file?replace_existing=true",
+            files={"file": ("school.csv", io.BytesIO(content), "text/csv")},
+        )
+        assert response.status_code == 200, response.text
+        db.info["school_id"] = 1
+        assert db.get(m.Teacher, teacher_a_id) is not None
+        assert db.scalar(select(func.count()).select_from(m.ScheduleEntry).where(m.ScheduleEntry.teacher_id == teacher_a_id)) == 1
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(require_admin, None)
 
 def test_absence_returns_reviewable_candidates_and_assigns_separately(db: Session):
     from datetime import date
@@ -105,3 +202,18 @@ def test_imported_teachers_are_active_and_available_for_absence(db: Session):
         assert [item["class"] for item in absence.json()["periods"]] == ["2/3", "2/3"]
     finally:
         app.dependency_overrides.clear()
+
+
+def test_daily_report_accepts_weekend_dates(db: Session):
+    def override_db():
+        yield db
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        for on_date, day in [("2026-10-23", "FRIDAY"), ("2026-10-24", "SATURDAY")]:
+            response = client.get("/api/reports/daily-substitutions", params={"on_date": on_date})
+            assert response.status_code == 200, response.text
+            assert response.json()["day"] == day
+            assert response.json()["assignments"] == []
+    finally:
+        app.dependency_overrides.pop(get_db, None)

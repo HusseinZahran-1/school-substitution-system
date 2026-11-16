@@ -1,11 +1,13 @@
 services:
   db:
     image: postgres:16-alpine
-    restart: unless-stopped
+    restart: "no"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-school_substitution}
       POSTGRES_USER: ${POSTGRES_USER:-school_admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -17,16 +19,40 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    restart: unless-stopped
+    restart: "no"
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-school_admin}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-school_substitution}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8001}
       SCHOOL_TIMEZONE: ${SCHOOL_TIMEZONE:-Asia/Amman}
-      SESSION_SECRET: ${SESSION_SECRET:-}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in the root .env file}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      LICENSE_HASH_SECRET: ${LICENSE_HASH_SECRET:-}
+      REGISTRATION_ENABLED: ${REGISTRATION_ENABLED:-true}
+      EMAIL_HOST: ${EMAIL_HOST:-}
+      EMAIL_PORT: ${EMAIL_PORT:-587}
+      EMAIL_USERNAME: ${EMAIL_USERNAME:-}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_USE_SSL: ${EMAIL_USE_SSL:-false}
+      EMAIL_USE_STARTTLS: ${EMAIL_USE_STARTTLS:-true}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5-coder:7b}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-180}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${APP_PORT:-8001}:8000"
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
 volumes:
   postgres_data:
+    name: school_substitution_system_postgres_data
+    external: true

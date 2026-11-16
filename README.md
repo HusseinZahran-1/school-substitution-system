@@ -1,5 +1,7 @@
 # نظام إدارة جدول الاحتياط المدرسي الآلي
 
+للنشر على VPS مع Docker وPostgreSQL وHTTPS تلقائي عبر Caddy، راجع [دليل النشر](DEPLOYMENT.md).
+
 تطبيق عربي لإدارة جدول المعلمين الأسبوعي، تسجيل الغياب، اقتراح بديل متاح بناءً على الجدول الفعلي، وتوثيق التقارير الإلكترونية اليومية.
 
 > **مصدر الجدول:** الملف الممسوح `Scanned Document.pdf` هو المرجع للمعلمين والشُعب والحصص. لا تُستخدم قائمة المعلمين التجريبية كمصدر للبيانات. كل خلية تُراجع من الملف قبل اعتمادها؛ لا تُخمن الخانات غير الواضحة.
@@ -8,8 +10,15 @@
 
 - إدارة المعلمين والمواد والشعب، مع تخصص متعدد لكل معلم.
 - جدول أسبوعي منطقي: معلم + يوم + حصة + شعبة + مادة + حالة (`TEACHING`, `FREE`, `DUTY`, `OTHER`).
-- شاشة دخول للإدارة مع إنشاء حساب أول مرة، وتخزين كلمة المرور بتجزئة PBKDF2 وجلسة موقعة في Cookie محمية.
-- عرض خلايا المعلمين لكل يوم، تعديل الخلايا، واستيراد Excel XLSX أو CSV بالعناوين العربية والإنجليزية.
+- تسجيل حساب باسم مستخدم بلا مسافات وبريد فريد، وكلمة مرور مخزنة بتجزئة Argon2id، وجلسة موقعة في Cookie محمية.
+- أدوار جاهزة (مدير، منسق، معلم) وأدوار مخصصة ينشئها المدير من صفحة **الأدوار والصلاحيات**. تشمل 12 صلاحية للعرض والتعديل والاستيراد والغياب والتكليفات والتقارير وهوية المدرسة.
+- يوزّع المدير الأدوار من **فريق المدرسة**؛ يتغير الوصول من الخادم مع كل طلب. إدارة الأدوار والحسابات مخصصة للمدير، وكل موظف يرى جدوله وتكليفاته الشخصية أيضًا.
+- تضاف صلاحيات العرض اللازمة تلقائيًا عند تفعيل صلاحيات التعديل. تغيير الدور المخصص يسري على جميع الموظفين المرتبطين به، وحذف الدور يتطلب نقل الموظفين إلى دور آخر أولًا. كل هذه الإجراءات تسجل في سجل التدقيق.
+- دعوات الموظفين ترسل رابط تفعيل أحادي الاستخدام صالحًا 24 ساعة؛ المدير يستطيع إعادة إرسال الدعوة أو تغيير الدور أو إيقاف الحساب.
+- كل حساب تسجيل جديد ينشئ مدرسة مستقلة؛ بيانات المعلمين والجداول والغياب والتقارير والشعار لا تظهر لحساب مدرسة أخرى.
+- تفعيل الحساب بمفتاح ترخيص عشوائي يُخزن HMAC hash فقط، ويرتبط بحساب واحد بعد التفعيل.
+- إرسال مفتاح التفعيل عبر SMTP وإشعارات Discord اختيارية؛ لا يعود المفتاح الخام من واجهات API.
+- عرض خلايا المعلمين لكل يوم، تعديل الخلايا، واستيراد جدول Word الأسبوعي DOCX أو Excel XLSX أو CSV بالعناوين العربية والإنجليزية.
 - لوحة جاهزية للجدول تعرض اكتمال الحصص، وعدد المعلمين والمواد والشعب والفترات الحرة، مع بحث وتصفية حسب حالة الجدول.
 - إنشاء المعلمين والتخصصات والشُعب تلقائيًا من الملف، مع استبدال اختياري للبيانات الحالية وحفظ ذري عند نجاح التحقق.
 - تسجيل غياب معلم لحصة واحدة أو أكثر، واكتشاف الفصل والمادة من الجدول.
@@ -17,7 +26,7 @@
 - شرح أهلية المرشح وسبب ترتيبه، مع خطوة منفصلة لتأكيد الاختيار أو اختيار بديل يدويًا.
 - حالة التكليف وسجل تدقيق وحمولة يومية وتقارير إلكترونية حسب التاريخ.
 - طباعة ورقية للجدول الأسبوعي والتقرير اليومي بتنسيق A4 أفقي.
-- PostgreSQL للإنتاج وSQLite افتراضيًا للتشغيل المحلي السريع.
+- PostgreSQL للتشغيل المحلي والإنتاج؛ SQLite مستخدم فقط داخل اختبارات الوحدة المعزولة.
 
 ## تحليل الجدول وتصميم البيانات
 
@@ -25,7 +34,7 @@
 
 المواد منفصلة في `subjects` وترتبط بالمعلمين بعلاقة متعدد إلى متعدد. الشعب مستقلة في `classes`. يسجل `absences` غياب اليوم، وتسجل `absence_periods` الحصص المطلوبة، ويربط كل تكليف في `substitution_assignments` بالغياب والفصل والمعلمين والحالة والموقع والملاحظات والتوقيع. يضمن قيد قاعدة البيانات `UNIQUE(date, period_number, substitute_teacher_id)` عدم تكليف معلم مرتين في الفترة نفسها. يحفظ `audit_logs` تغييرات إنشاء/إسناد/تأكيد/إكمال/إلغاء التكليف.
 
-يدعم المستورد صفوف CSV الطويلة (`teacher,day,period,status,class,subject`) والجداول العريضة التي تحتوي أعمدة `الحصة_1` إلى `الحصة_7` مع عمود اليوم، وكذلك ملفات XLSX ذات عناوين الأيام والفترات. الخانة الفارغة في الجدول العريض تُسجل `FREE`، والرمز `ح` أو كلمة «احتياط» تُسجل `DUTY`، وقيم الشُعب مثل `1/2` تُسجل `TEACHING`. تُعرض تعارضات المعلم المكررة بدل تخمين الاختيار.
+يدعم المستورد جدول المعلمين الأسبوعي في DOCX، وصفوف CSV الطويلة (`teacher,day,period,status,class,subject`) والجداول العريضة ذات أعمدة `الحصة_1` إلى `الحصة_7`، وملفات XLSX. الخانات الفارغة تُسجل `FREE`، والرموز `ح1` إلى `ح5` تُسجل كخانات احتياط متاحة؛ تكون أولوية الترشيح ح1 ثم ح2 إلى ح5 قبل الفراغ العادي. الرمز `ح` المفرد أو «احتياط» يُسجل `DUTY`، والشُعب مثل `1/2` تُسجل `TEACHING`. تُعرض تعارضات المعلم المكررة بدل تخمين الاختيار.
 
 ## منطق الترشيح
 
@@ -43,7 +52,7 @@
 - Backend: Python 3.12+, FastAPI, SQLAlchemy 2, Pydantic 2, Alembic.
 - Database: PostgreSQL 16 عبر `psycopg`; SQLite للاستخدام المحلي والاختبارات.
 - Frontend: HTML/CSS/JavaScript دون إطار عمل، عربية RTL.
-- أول زيارة تعرض إعداد حساب المدير، وبعدها تتطلب الواجهة وواجهات API تسجيل الدخول.
+- تسجيل الدخول يتطلب كلمة المرور وترخيصًا مفعّلًا لمدير المدرسة؛ حسابات الموظفين تنشط بعد دعوة البريد. تستخدم الجلسات Cookies من نوع `HttpOnly` و`SameSite=Lax`، ويُفعّل `Secure` عند HTTPS، مع منع CSRF ورؤوس حماية المتصفح ومنع تخزين استجابات API.
 
 ```text
 backend/app/{api.py,engine.py,models.py,schemas.py,core.py,database.py,security.py,schedule_import.py,main.py}
@@ -56,49 +65,30 @@ docker-compose.yml               PostgreSQL + API
 
 ## تشغيل Windows محليًا
 
-من PowerShell:
+التشغيل العادي يتطلب PostgreSQL. أنشئ `.env` في جذر المشروع من `.env.example`، وغيّر `POSTGRES_PASSWORD` و`SESSION_SECRET` إلى قيم خاصة بك. بعد تثبيت Docker Desktop وتشغيله، افتح PowerShell من جذر المشروع وابدأ قاعدة البيانات:
+
+```powershell
+docker volume create school_substitution_system_postgres_data
+docker compose up -d db
+```
+
+ثم ثبّت متطلبات Python وشغّل الخادم محليًا:
 
 ```powershell
 cd backend
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-```
-
-يعمل SQLite محليًا تلقائيًا إذا لم تعدل `DATABASE_URL`. أنشئ المخطط وشغّل الخادم:
-
-```powershell
-alembic upgrade head
 uvicorn app.main:app --reload --port 8001
 ```
 
-يمكن أيضًا تشغيله من مجلد `backend` مباشرةً باستخدام `python app/main.py`؛ سيبدأ الخادم على `http://127.0.0.1:8001`.
-
-```powershell
-$env:PORT = "8002"
-python app/main.py
-```
-
-أو شغّل Uvicorn مباشرةً: `uvicorn app.main:app --reload --port 8002`.
+يقرأ التطبيق `.env` من جذر المشروع تلقائيًا ويستخدم PostgreSQL على المنفذ المحدد في `POSTGRES_PORT` (افتراضيًا `5432`). إذا كان PostgreSQL آخر يستخدم هذا المنفذ، اختر منفذًا آخر مثل `5433` في `.env`. يطبق التطبيق ترحيلات قاعدة البيانات تلقائيًا عند بدء التشغيل. لتشغيل النظام كاملًا بالحاويات، استخدم قسم Docker Compose أدناه.
 
 افتح http://localhost:8001 للواجهة أو http://localhost:8001/docs لتوثيق OpenAPI.
 
-### PostgreSQL محليًا
-
-أنشئ قاعدة PostgreSQL ومستخدمًا، ثم عدل `backend/.env`:
-
-```env
-DATABASE_URL=postgresql+psycopg://school_admin:YOUR_PASSWORD@localhost:5432/school_substitution
-CORS_ORIGINS=http://localhost:8001
-SCHOOL_TIMEZONE=Asia/Amman
-SESSION_SECRET=<random-long-secret>
-```
-
-نفّذ `alembic upgrade head` ثم شغّل Uvicorn كما أعلاه.
-
 ## Docker Compose
 
-أنشئ ملف `.env` في جذر المشروع، ولا تضعه في Git:
+أنشئ ملف `.env` في جذر المشروع من `.env.example`، ولا تضعه في Git. أضف إعدادات SMTP الحقيقية كي تصل مفاتيح التفعيل، وأضف رابط Discord Webhook اختياريًا للإشعارات. لا تضع هذه القيم في الواجهة الأمامية:
 
 ```env
 POSTGRES_DB=school_substitution
@@ -108,22 +98,39 @@ CORS_ORIGINS=http://localhost:8001
 APP_PORT=8001
 SCHOOL_TIMEZONE=Asia/Amman
 SESSION_SECRET=<random-long-secret>
+SESSION_COOKIE_SECURE=false
+LICENSE_HASH_SECRET=<another-random-long-secret>
+EMAIL_HOST=smtp.example.com
+EMAIL_PORT=587
+EMAIL_USERNAME=mailer@example.com
+EMAIL_PASSWORD=<smtp-password>
+EMAIL_FROM=mailer@example.com
+EMAIL_USE_SSL=false
+EMAIL_USE_STARTTLS=true
+DISCORD_WEBHOOK_URL=
 ```
+
+في النشر خلف HTTPS، اضبط `SESSION_COOKIE_SECURE=true` وأنهِ TLS عبر وكيل موثوق.
 
 ثم:
 
 ```powershell
+docker volume create school_substitution_system_postgres_data
 docker compose up --build
 ```
 
-الخادم يطبق ترحيلات Alembic عند البدء. الواجهة متاحة على `http://localhost:8001` افتراضيًا؛ غيّر `APP_PORT` إذا كان المنفذ مستخدمًا. البيانات دائمة في volume `postgres_data`.
+أمر إنشاء volume مطلوب عند أول تثبيت فقط؛ إذا كان موجودًا، يحتفظ ببياناته. الخادم يطبق ترحيلات Alembic عند البدء. الواجهة متاحة على `http://localhost:8001` افتراضيًا؛ غيّر `APP_PORT` إذا كان المنفذ مستخدمًا. حساب الإدارة والجدول محفوظان في volume PostgreSQL خارجي ثابت اسمه `school_substitution_system_postgres_data`، لذلك يبقيه Docker حتى عند حذف الحاويات. ومفتاح الجلسة محفوظ في `.env` حتى يبقى تسجيل الدخول صالحًا بعد إعادة تشغيل الحاوية.
+
+لإيقاف النظام وإعادة تشغيله استخدم `docker compose stop` ثم `docker compose start`، أو `docker compose down` ثم `docker compose up -d`. لأن قاعدة البيانات volume خارجي، لن يحذف `docker compose down -v` بيانات PostgreSQL؛ مع ذلك احتفظ بنسخة احتياطية من مجلد المشروع وملف `.env`.
 
 ## تجهيز بيانات المدرسة
 
-1. أنشئ حساب المدير عند فتح التطبيق لأول مرة.
-2. افتح «الجدول الأسبوعي»، اختر XLSX أو CSV، ثم «قراءة واستيراد تلقائي».
-3. خيار استبدال البيانات مفعّل افتراضيًا؛ راجع اسم الملف والتأكيد قبل الاستيراد. يحتفظ النظام بسجلات الغياب والتكليف القديمة ويعطل المعلمين القدامى فقط إذا كانت لهم سجلات تاريخية.
-4. لا تبدأ تسجيل الغياب قبل التأكد من أن الملف يحتوي تدريسًا وفترات فراغ صحيحة؛ لا يعتبر غياب الخانة دليلًا على التوفر.
+1. أنشئ حسابًا من زر «إنشاء حساب جديد» باسم مستخدم بلا مسافات وبريد إلكتروني. سيُرسل مفتاح التفعيل عبر SMTP.
+2. سجّل الدخول باسم المستخدم وكلمة المرور، ثم أدخل مفتاح الترخيص في شاشة التفعيل. بعد ذلك يصبح الدخول طبيعيًا.
+3. افتح «الجدول الأسبوعي»، ارفع DOCX لجدول المعلمين الأسبوعي أو XLSX/CSV، ثم «قراءة واستيراد تلقائي». خانات ح1 ثم ح2 إلى ح5 تكون أولوية المرشحين، قبل أوقات الفراغ العادية.
+4. خيار استبدال البيانات مفعّل افتراضيًا؛ راجع اسم الملف والتأكيد قبل الاستيراد. يحتفظ النظام بسجلات الغياب والتكليف القديمة ويعطل المعلمين القدامى فقط إذا كانت لهم سجلات تاريخية.
+5. لا تبدأ تسجيل الغياب قبل التأكد من أن الملف يحتوي تدريسًا وفترات فراغ صحيحة؛ لا يعتبر غياب الخانة دليلًا على التوفر.
+6. من «إعدادات المدرسة» احفظ اسم المدرسة ورابط شعارها أو ارفع صورة PNG/JPG/WebP؛ يظهر شعار الوزارة على يسار رأس كل صفحة مطبوعة وشعار المدرسة على يمينه.
 
 CSV UTF-8 يقبل الأعمدة الإلزامية `teacher,day,period,status` والاختيارية `class,subject,notes`:
 
@@ -138,14 +145,16 @@ teacher,day,period,status,class,subject,notes
 ## API مختصر
 
 - `GET/POST /api/teachers`, `GET/PUT/DELETE /api/teachers/{id}`
+- `GET/POST /api/staff`, `PUT/DELETE /api/staff/{id}`, `POST /api/staff/{id}/resend-invite` (للمدير)
+- `GET /api/staff/me`, `/api/staff/me/schedule`, `/api/staff/me/assignments` (للموظف)
 - `GET/POST /api/subjects`, `GET/POST /api/classes`
-- `GET/POST /api/schedule`, `PUT/DELETE /api/schedule/{id}`, `POST /api/schedule/import-file` (CSV/XLSX)
+- `GET/POST /api/schedule`, `PUT/DELETE /api/schedule/{id}`, `POST /api/schedule/import-file` (DOCX/CSV/XLSX)
 - `POST /api/absences`, `GET /api/absences`
 - `POST /api/substitutions/suggest` returns ranked candidates without confirming an assignment
 - `GET /api/substitutions?on_date=YYYY-MM-DD`
 - `POST /api/substitutions/{id}/assign`, `/confirm`, `/complete`, `/cancel`
 - `GET /api/dashboard/today`, `GET /api/dashboard/overview`, `GET /api/reports/daily-substitutions?on_date=YYYY-MM-DD`
-- `POST /api/auth/setup`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/status`
+- `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/activate-license`, `POST /api/auth/logout`, `GET /api/auth/status`
 - `GET /api/audit`, `GET /api/health`
 
 مثال تسجيل غياب:
@@ -172,7 +181,7 @@ teacher,day,period,status,class,subject,notes
 
 ## الاختبارات
 
-من جذر المشروع بعد تثبيت `backend/requirements.txt`:
+من جذر المشروع بعد تثبيت `backend/requirements-dev.txt`:
 
 ```powershell
 python -m pytest
@@ -182,4 +191,4 @@ python -m pytest
 
 ## تحسينات مستقبلية
 
-إدارة عدة مديرين، إعدادات متعددة المدارس، عطلات وجداول استثنائية، إشعارات، تسجيل توقيع رقمي، إحصاءات، تصدير PDF، وتحسين متزامن لعدة حصص. قاعدة البيانات تفصل الجداول والغياب والتكليفات بما يسمح بالتوسع دون تغيير معنى الخانة الأسبوعية.
+إدارة عدة مديرين للمدرسة نفسها، عطلات وجداول استثنائية، إشعارات، تسجيل توقيع رقمي، إحصاءات، تصدير PDF، وتحسين متزامن لعدة حصص. قاعدة البيانات تفصل بيانات كل مدرسة عن الأخرى.

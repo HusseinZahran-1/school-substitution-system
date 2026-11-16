@@ -1,7 +1,11 @@
 """REST endpoints for the school administration workflow."""
+from collections import Counter
 from datetime import date, datetime, timezone
+import secrets
+import smtplib
+from datetime import timedelta
 from zoneinfo import ZoneInfo
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -9,11 +13,19 @@ from .database import get_db
 from . import models as m
 from .core import Day, AssignmentStatus, settings
 from .engine import school_day, suggest_candidates
-from .schemas import TeacherIn, SubjectIn, ClassIn, ScheduleIn, AbsenceIn, AssignIn, StatusIn, SuggestIn
-from .security import require_admin
+from .schemas import TeacherIn, SubjectIn, ClassIn, ScheduleIn, AbsenceIn, AssignIn, StatusIn, SuggestIn, SchoolSettingsIn, StaffAccountCreateIn, StaffAccountUpdateIn
+from .security import _password_digest, _staff_invite_digest, require_school_scope, STAFF_INVITE_HOURS
 from .schedule_import import parse_schedule_file
+from .permissions import account_access
+from .notifications import EmailDeliveryNotConfigured, send_staff_invitation_email
 
-router = APIRouter(prefix="/api", dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/api", dependencies=[Depends(require_school_scope)])
+
+def _school_id(db: Session) -> int:
+    school_id = db.info.get("school_id")
+    if school_id is None:
+        raise RuntimeError("School scope is missing from the request session")
+    return school_id
 
 def _commit(db: Session, message: str = "البيانات متعارضة أو مكررة"):
     try:
@@ -30,8 +42,183 @@ def _teacher(db: Session, teacher_id: int) -> m.Teacher:
 def _audit(db: Session, entity: str, entity_id: int, action: str, actor: str | None, detail: str | None = None):
     db.add(m.AuditLog(entity_type=entity, entity_id=entity_id, action=action, actor=actor, detail=detail))
 
+def _manager_only(account):
+    if not isinstance(account, m.AdminAccount):
+        raise HTTPException(403, "إدارة حسابات الموظفين متاحة لمدير المدرسة فقط")
+
+def _staff_account_view(item: m.StaffAccount):
+    return {"id": item.id, "teacher_id": item.teacher_id, "teacher_name": item.teacher.name,
+            "username": item.username, "email": item.email, **account_access(item), "custom_role_id": item.custom_role_id,
+            "is_active": item.is_active, "invite_expires_at": item.invite_expires_at}
+
+def _assigned_role(db, payload):
+    if payload.role != "CUSTOM":
+        if payload.custom_role_id is not None:
+            raise HTTPException(422, "اختر دورًا مخصصًا لإرفاق معرف الدور")
+        return None
+    role = db.scalar(select(m.SchoolRole).where(m.SchoolRole.id == payload.custom_role_id).with_for_update())
+    if not role:
+        raise HTTPException(404, "الدور المخصص غير موجود في مدرستك")
+    return role
+
+@router.get("/staff")
+def list_staff_accounts(db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
+    _manager_only(admin)
+    rows = db.scalars(select(m.StaffAccount).options(selectinload(m.StaffAccount.teacher)).order_by(m.StaffAccount.username)).all()
+    return [_staff_account_view(row) for row in rows]
+
+@router.post("/staff", status_code=201)
+def create_staff_account(payload: StaffAccountCreateIn, request: Request, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
+    _manager_only(admin)
+    if not settings.email_host or not settings.email_from:
+        raise HTTPException(503, "إعدادات البريد غير مكتملة؛ تعذر إرسال دعوة التفعيل")
+    assigned_role = _assigned_role(db, payload)
+    teacher = _teacher(db, payload.teacher_id)
+    if not teacher.is_active:
+        raise HTTPException(400, "فعّل المعلم قبل إنشاء حساب له")
+    if db.scalar(select(m.AdminAccount.id).where(func.lower(m.AdminAccount.username) == payload.username)) or db.scalar(
+        select(m.StaffAccount.id).where(func.lower(m.StaffAccount.username) == payload.username)
+    ):
+        raise HTTPException(409, "اسم المستخدم مستخدم مسبقًا")
+    if db.scalar(select(m.AdminAccount.id).where(func.lower(m.AdminAccount.email) == payload.email)) or db.scalar(
+        select(m.StaffAccount.id).where(func.lower(m.StaffAccount.email) == payload.email)
+    ):
+        raise HTTPException(409, "البريد الإلكتروني مستخدم مسبقًا")
+    if not settings.public_app_url and settings.app_env.lower() == "production":
+        raise HTTPException(503, "أضف PUBLIC_APP_URL في إعدادات التشغيل لإرسال رابط الدعوة")
+    base_url = settings.public_app_url or str(request.base_url).rstrip("/")
+    token = secrets.token_urlsafe(40)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=STAFF_INVITE_HOURS)
+    item = m.StaffAccount(
+        school_id=admin.school_id,
+        teacher_id=teacher.id,
+        username=payload.username,
+        email=str(payload.email),
+        role=payload.role,
+        custom_role_id=assigned_role.id if assigned_role else None,
+        password_hash=_password_digest(secrets.token_urlsafe(40)),
+        is_active=False,
+        invite_token_hash=_staff_invite_digest(token),
+        invite_expires_at=expires_at,
+    )
+    db.add(item)
+    try:
+        db.flush()
+        invite_link = f"{base_url.rstrip('/')}#staff_invite={token}"
+        school = db.get(m.School, admin.school_id)
+        send_staff_invitation_email(item.email, school.name if school else "المدرسة", teacher.name, account_access(item)["role_name"], invite_link)
+        _audit(db, "staff_account", item.id, "INVITED", admin.username, f"teacher={teacher.id}; role={item.role}")
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "اسم المستخدم أو البريد الإلكتروني مستخدم مسبقًا") from exc
+    except (EmailDeliveryNotConfigured, OSError, smtplib.SMTPException) as exc:
+        db.rollback()
+        raise HTTPException(503, "تعذر إرسال الدعوة؛ تحقق من إعدادات SMTP واتصال البريد الصادر") from exc
+    db.refresh(item)
+    return _staff_account_view(item)
+
+@router.delete("/staff/{staff_id}", status_code=204)
+def deactivate_staff_account(staff_id: int, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
+    _manager_only(admin)
+    item = db.get(m.StaffAccount, staff_id)
+    if not item:
+        raise HTTPException(404, "حساب الموظف غير موجود")
+    item.is_active = False
+    item.session_version += 1
+    _audit(db, "staff_account", item.id, "DEACTIVATED", admin.username)
+    item.invite_token_hash = None
+    item.invite_expires_at = None
+    _commit(db)
+
+@router.put("/staff/{staff_id}")
+def update_staff_account(staff_id: int, payload: StaffAccountUpdateIn, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
+    _manager_only(admin)
+    item = db.get(m.StaffAccount, staff_id)
+    if not item:
+        raise HTTPException(404, "حساب الموظف غير موجود")
+    assigned_role = _assigned_role(db, payload)
+    item.role = payload.role
+    item.custom_role = assigned_role
+    item.custom_role_id = assigned_role.id if assigned_role else None
+    item.session_version += 1
+    _audit(db, "staff_account", item.id, "UPDATED", admin.username, f"role={payload.role}; custom_role_id={item.custom_role_id}")
+    _commit(db)
+    return _staff_account_view(item)
+
+@router.post("/staff/{staff_id}/resend-invite")
+def resend_staff_invitation(staff_id: int, request: Request, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
+    _manager_only(admin)
+    if not settings.email_host or not settings.email_from:
+        raise HTTPException(503, "إعدادات البريد غير مكتملة؛ تعذر إرسال دعوة التفعيل")
+    item = db.scalar(select(m.StaffAccount).options(selectinload(m.StaffAccount.teacher)).where(m.StaffAccount.id == staff_id))
+    if not item:
+        raise HTTPException(404, "حساب الموظف غير موجود")
+    if item.is_active:
+        raise HTTPException(409, "الحساب مفعّل بالفعل")
+    if not settings.public_app_url and settings.app_env.lower() == "production":
+        raise HTTPException(503, "أضف PUBLIC_APP_URL في إعدادات التشغيل لإرسال رابط الدعوة")
+    token = secrets.token_urlsafe(40)
+    item.invite_token_hash = _staff_invite_digest(token)
+    item.invite_expires_at = datetime.now(timezone.utc) + timedelta(hours=STAFF_INVITE_HOURS)
+    base_url = settings.public_app_url or str(request.base_url).rstrip("/")
+    school = db.get(m.School, admin.school_id)
+    try:
+        send_staff_invitation_email(item.email, school.name if school else "المدرسة", item.teacher.name, account_access(item)["role_name"],
+                                    f"{base_url.rstrip('/')}#staff_invite={token}")
+        _commit(db)
+    except (EmailDeliveryNotConfigured, OSError, smtplib.SMTPException) as exc:
+        db.rollback()
+        raise HTTPException(503, "تعذر إرسال الدعوة؛ تحقق من إعدادات SMTP واتصال البريد الصادر") from exc
+    return {"sent": True}
+
+@router.get("/staff/me")
+def staff_profile(admin: m.AdminAccount | m.StaffAccount = Depends(require_school_scope)):
+    return {"username": admin.username, **account_access(admin),
+            "teacher_id": getattr(admin, "teacher_id", None)}
+
+@router.get("/staff/me/schedule")
+def staff_own_schedule(day: Day | None = None, admin: m.AdminAccount | m.StaffAccount = Depends(require_school_scope), db: Session = Depends(get_db)):
+    teacher_id = getattr(admin, "teacher_id", None)
+    if teacher_id is None:
+        return []
+    query = select(m.ScheduleEntry).options(selectinload(m.ScheduleEntry.school_class), selectinload(m.ScheduleEntry.subject)).where(m.ScheduleEntry.teacher_id == teacher_id)
+    if day:
+        query = query.where(m.ScheduleEntry.day_of_week == day.value)
+    return db.scalars(query.order_by(m.ScheduleEntry.day_of_week, m.ScheduleEntry.period_number)).all()
+
+@router.get("/staff/me/assignments")
+def staff_own_assignments(on_date: date | None = None, admin: m.AdminAccount | m.StaffAccount = Depends(require_school_scope), db: Session = Depends(get_db)):
+    teacher_id = getattr(admin, "teacher_id", None)
+    if teacher_id is None:
+        return []
+    query = select(m.SubstitutionAssignment).options(selectinload(m.SubstitutionAssignment.absent_teacher), selectinload(m.SubstitutionAssignment.school_class)).where(m.SubstitutionAssignment.substitute_teacher_id == teacher_id)
+    if on_date:
+        query = query.where(m.SubstitutionAssignment.date == on_date)
+    return db.scalars(query.order_by(m.SubstitutionAssignment.date.desc(), m.SubstitutionAssignment.period_number)).all()
+
 @router.get("/health")
-def health(): return {"status": "ok"}
+def health(db: Session = Depends(get_db)):
+    db.execute(select(1))
+    return {"status": "ok", "database": "connected"}
+
+@router.get("/school-settings")
+def school_settings(db: Session = Depends(get_db)):
+    item = db.scalar(select(m.SchoolSettings).where(m.SchoolSettings.school_id == _school_id(db)))
+    school = db.get(m.School, _school_id(db))
+    return {"school_name": item.school_name if item else (school.name if school else "المدرسة"), "school_logo_url": item.school_logo_url if item else None}
+
+@router.put("/school-settings")
+def update_school_settings(payload: SchoolSettingsIn, db: Session = Depends(get_db)):
+    item = db.scalar(select(m.SchoolSettings).where(m.SchoolSettings.school_id == _school_id(db)))
+    if item is None:
+        item = m.SchoolSettings(school_id=_school_id(db), school_name=payload.school_name, school_logo_url=payload.school_logo_url)
+        db.add(item)
+    else:
+        item.school_name = payload.school_name
+        item.school_logo_url = payload.school_logo_url
+    _commit(db)
+    return item
 
 @router.get("/teachers")
 def teachers(active_only: bool = False, db: Session = Depends(get_db)):
@@ -125,10 +312,13 @@ async def import_schedule_file(
     file: UploadFile = File(...),
     replace_existing: bool = False,
     db: Session = Depends(get_db),
-    admin: m.AdminAccount = Depends(require_admin),
+    admin: m.AdminAccount = Depends(require_school_scope),
 ):
-    """Auto-create teachers, subjects and classes, then import CSV/XLSX cells atomically."""
-    content = await file.read()
+    """Auto-create teachers, subjects and classes, then import DOCX/CSV/XLSX cells atomically."""
+    max_upload_bytes = 10 * 1024 * 1024
+    content = await file.read(max_upload_bytes + 1)
+    if len(content) > max_upload_bytes:
+        raise HTTPException(413, "حجم ملف الجدول يجب ألا يتجاوز 10 ميغابايت")
     cells, layout = parse_schedule_file(file.filename or "schedule.csv", content)
     normalized_name = lambda name: " ".join(name.split())
     deduped = {}
@@ -138,7 +328,7 @@ async def import_schedule_file(
         teacher_name = normalized_name(cell.teacher)
         class_name = normalized_name(cell.class_name) if cell.class_name else None
         key = (teacher_name, cell.day, cell.period)
-        value = (cell.status, class_name, cell.subject)
+        value = (cell.status, class_name, cell.subject, cell.notes)
         if key in deduped:
             if deduped[key] != value:
                 duplicate_errors.append({"teacher": teacher_name, "day": cell.day, "period": cell.period,
@@ -151,8 +341,14 @@ async def import_schedule_file(
     cells = [
         type(cell)(normalized_name(cell.teacher), cell.day, cell.period, cell.status,
                    normalized_name(cell.class_name) if cell.class_name else None,
-                   normalized_name(cell.subject) if cell.subject else None, cell.notes)
+                   normalized_name(cell.subject) if cell.subject else None, cell.notes, cell.declared_load)
         for cell in unique_cells
+    ]
+    declared_loads = {cell.teacher: cell.declared_load for cell in cells if cell.declared_load is not None}
+    actual_loads = Counter(cell.teacher for cell in cells if cell.status == "TEACHING")
+    load_warnings = [
+        {"teacher": teacher, "declared": declared, "found": actual_loads[teacher]}
+        for teacher, declared in declared_loads.items() if actual_loads[teacher] != declared
     ]
     teachers_by_name = {t.name.strip(): t for t in db.scalars(select(m.Teacher)).all()}
     subjects_by_name = {s.name.strip(): s for s in db.scalars(select(m.Subject)).all()}
@@ -237,17 +433,19 @@ async def import_schedule_file(
     except Exception:
         db.rollback()
         raise
+    reserve_slots = sum(1 for cell in cells if (cell.notes or "").startswith("RESERVE_PRIORITY:"))
     return {"imported": len(cells), "layout": layout, "teachers": len(incoming_teachers),
             "subjects": len(incoming_subjects), "classes": len(incoming_classes), "replaced": replace_existing,
+            "reserve_slots": reserve_slots, "load_warnings": load_warnings,
             "message": "تمت قراءة الملف وإنشاء المعلمين والتخصصات والشعب والحصص تلقائيًا."}
 
 @router.post("/absences", status_code=201)
-def create_absence(payload: AbsenceIn, db: Session = Depends(get_db)):
+def create_absence(payload: AbsenceIn, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
     teacher = _teacher(db, payload.teacher_id)
     if not teacher.is_active: raise HTTPException(400, "المعلم غير نشط")
     try: day = school_day(payload.date)
     except ValueError as exc: raise HTTPException(400, str(exc)) from exc
-    absence = m.Absence(teacher_id=teacher.id, date=payload.date, reason=payload.reason, created_by=payload.created_by)
+    absence = m.Absence(teacher_id=teacher.id, date=payload.date, reason=payload.reason, created_by=admin.username)
     db.add(absence); db.flush()
     results = []
     for period_data in payload.periods:
@@ -260,7 +458,7 @@ def create_absence(payload: AbsenceIn, db: Session = Depends(get_db)):
         if not absent_entry and not period_data.class_id: db.rollback(); raise HTTPException(400, f"لا توجد حصة مسجلة للمعلم في الحصة {period}؛ حدد الشعبة يدويًا أو أدخل الجدول أولًا")
         ap = m.AbsencePeriod(absence_id=absence.id, period_number=period, class_id=class_id); db.add(ap); db.flush()
         assignment = m.SubstitutionAssignment(absence_period_id=ap.id, absent_teacher_id=teacher.id, date=payload.date, period_number=period,
-            class_id=class_id, created_by=payload.created_by)
+            class_id=class_id, created_by=admin.username)
         db.add(assignment); db.flush()
         subject_id = absent_entry.subject_id if absent_entry else None
         candidates = suggest_candidates(db, absent_teacher=teacher, on_date=payload.date, period=period, subject_id=subject_id)
@@ -268,7 +466,7 @@ def create_absence(payload: AbsenceIn, db: Session = Depends(get_db)):
         results.append({"assignment_id": assignment.id, "period": period, "class": selected_class.name if selected_class else None,
                         "subject": absent_entry.subject.name if absent_entry and absent_entry.subject else None,
                         "status": "SUGGESTED", "recommended_substitute": candidates[0] if candidates else None, "candidates": candidates})
-    _audit(db, "absence", absence.id, "CREATED", payload.created_by, f"{len(results)} حصص")
+    _audit(db, "absence", absence.id, "CREATED", admin.username, f"{len(results)} حصص")
     _commit(db)
     return {"absence_id": absence.id, "absent_teacher": {"id": teacher.id, "name": teacher.name}, "date": payload.date, "day": day, "periods": results}
 
@@ -310,7 +508,7 @@ def substitutions(on_date: date | None = None, db: Session = Depends(get_db)):
     return db.scalars(query.order_by(m.SubstitutionAssignment.date.desc(), m.SubstitutionAssignment.period_number)).all()
 
 @router.post("/substitutions/{assignment_id}/assign")
-def assign_substitute(assignment_id: int, payload: AssignIn, db: Session = Depends(get_db)):
+def assign_substitute(assignment_id: int, payload: AssignIn, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
     assignment = db.get(m.SubstitutionAssignment, assignment_id)
     if not assignment: raise HTTPException(404, "تكليف الاحتياط غير موجود")
     if assignment.status in ("CANCELLED", "COMPLETED"): raise HTTPException(409, "لا يمكن تغيير تكليف ملغى أو مكتمل")
@@ -322,33 +520,33 @@ def assign_substitute(assignment_id: int, payload: AssignIn, db: Session = Depen
     if candidate.id not in {c["id"] for c in candidates} and candidate.id != assignment.substitute_teacher_id:
         raise HTTPException(409, "المعلم غير متاح في هذه الحصة أو لديه تعارض")
     assignment.substitute_teacher_id = candidate.id; assignment.waiting_location = payload.waiting_location
-    assignment.notes = payload.notes; assignment.status = "ASSIGNED"; assignment.approved_by = payload.approved_by
+    assignment.notes = payload.notes; assignment.status = "ASSIGNED"; assignment.approved_by = admin.username
     assignment.approved_at = datetime.now(timezone.utc)
-    _audit(db, "substitution", assignment.id, "ASSIGNED", payload.approved_by, f"substitute={candidate.id}")
+    _audit(db, "substitution", assignment.id, "ASSIGNED", admin.username, f"substitute={candidate.id}")
     _commit(db, "هذا المعلم مكلف باحتياط آخر في الحصة نفسها"); return assignment
 
 @router.post("/substitutions/{assignment_id}/confirm")
-def confirm_substitute(assignment_id: int, payload: StatusIn, db: Session = Depends(get_db)):
+def confirm_substitute(assignment_id: int, payload: StatusIn, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
     item = db.get(m.SubstitutionAssignment, assignment_id)
     if not item: raise HTTPException(404, "تكليف الاحتياط غير موجود")
     if not item.substitute_teacher_id or item.status not in ("ASSIGNED", "CONFIRMED"): raise HTTPException(409, "يجب تعيين معلم قبل التأكيد")
-    item.status = "CONFIRMED"; item.signature = payload.signature
-    _audit(db, "substitution", item.id, "CONFIRMED", payload.actor); _commit(db); return item
+    item.status = "CONFIRMED"; item.signature = admin.username
+    _audit(db, "substitution", item.id, "CONFIRMED", admin.username); _commit(db); return item
 
 @router.post("/substitutions/{assignment_id}/complete")
-def complete_substitute(assignment_id: int, payload: StatusIn, db: Session = Depends(get_db)):
+def complete_substitute(assignment_id: int, payload: StatusIn, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
     item = db.get(m.SubstitutionAssignment, assignment_id)
     if not item: raise HTTPException(404, "تكليف الاحتياط غير موجود")
     if item.status not in ("ASSIGNED", "CONFIRMED"): raise HTTPException(409, "التكليف غير مسند")
-    item.status = "COMPLETED"; _audit(db, "substitution", item.id, "COMPLETED", payload.actor); _commit(db); return item
+    item.status = "COMPLETED"; _audit(db, "substitution", item.id, "COMPLETED", admin.username); _commit(db); return item
 
 @router.post("/substitutions/{assignment_id}/cancel")
-def cancel_substitute(assignment_id: int, payload: StatusIn, db: Session = Depends(get_db)):
+def cancel_substitute(assignment_id: int, payload: StatusIn, db: Session = Depends(get_db), admin: m.AdminAccount = Depends(require_school_scope)):
     item = db.get(m.SubstitutionAssignment, assignment_id)
     if not item: raise HTTPException(404, "تكليف الاحتياط غير موجود")
     former_substitute = item.substitute_teacher_id
     item.status = "CANCELLED"; item.substitute_teacher_id = None
-    _audit(db, "substitution", item.id, "CANCELLED", payload.actor, f"former_substitute={former_substitute}"); _commit(db); return item
+    _audit(db, "substitution", item.id, "CANCELLED", admin.username, f"former_substitute={former_substitute}"); _commit(db); return item
 
 @router.get("/dashboard/today")
 def dashboard(on_date: date | None = None, db: Session = Depends(get_db)):
@@ -373,7 +571,17 @@ def dashboard_overview(db: Session = Depends(get_db)):
     ).all()
     counts = {status: count for status, count in status_counts}
     configured = sum(counts.values())
-    expected = active_teachers * 5 * 7
+    day_periods = db.execute(
+        select(m.ScheduleEntry.day_of_week, func.max(m.ScheduleEntry.period_number))
+        .join(m.Teacher, m.Teacher.id == m.ScheduleEntry.teacher_id)
+        .where(m.Teacher.is_active.is_(True))
+        .group_by(m.ScheduleEntry.day_of_week)
+    ).all()
+    # Some school timetables have fewer periods on particular days. Once all
+    # five school days are represented, use their actual period counts; for a
+    # partial or empty import retain the standard 5×7 readiness target.
+    periods_per_week = sum(max_period for _, max_period in day_periods) if len(day_periods) == 5 else 5 * 7
+    expected = active_teachers * periods_per_week
     missing = max(0, expected - configured)
     return {
         "active_teachers": active_teachers,
@@ -391,9 +599,12 @@ def dashboard_overview(db: Session = Depends(get_db)):
 
 @router.get("/reports/daily-substitutions")
 def daily_report(on_date: date, db: Session = Depends(get_db)):
-    day = school_day(on_date)
+    # Reports can be opened for any calendar date, including days without classes.
+    day = ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY")[on_date.weekday()]
     rows = db.scalars(select(m.SubstitutionAssignment).options(selectinload(m.SubstitutionAssignment.absent_teacher), selectinload(m.SubstitutionAssignment.substitute_teacher), selectinload(m.SubstitutionAssignment.school_class)).where(m.SubstitutionAssignment.date == on_date).order_by(m.SubstitutionAssignment.period_number)).all()
-    return {"date": on_date, "day": day, "school_name": "المدرسة", "assignments": rows}
+    branding = db.scalar(select(m.SchoolSettings).where(m.SchoolSettings.school_id == _school_id(db)))
+    school = db.get(m.School, _school_id(db))
+    return {"date": on_date, "day": day, "school_name": branding.school_name if branding else (school.name if school else "المدرسة"), "assignments": rows}
 
 @router.get("/audit")
 def audit_log(entity_type: str | None = None, db: Session = Depends(get_db)):
